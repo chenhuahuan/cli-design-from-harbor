@@ -4,22 +4,16 @@ Command-line interface to the Harbor API.
 
 from __future__ import print_function
 import argparse
-import getpass
+
 import logging
-import os
 import sys
+import utils
 
 from oslo_utils import encodeutils
 from oslo_utils import importutils
 
-import harborclient
-from harborclient import api_versions
-from harborclient import client
-from harborclient import exceptions as exc
-from harborclient import utils
 
-DEFAULT_API_VERSION = "2.0"
-DEFAULT_MAJOR_OS_COMPUTE_API_VERSION = "2.0"
+__defined_modules__ = ('submodule',)
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +58,7 @@ class HarborClientArgumentParser(argparse.ArgumentParser):
 
 
 class HarborShell(object):
-    times = []
-
-    def _append_global_identity_args(self, parser, argv):
-        # Register the CLI arguments that have moved to the session object.
-        parser.set_defaults(os_username=utils.env('HARBOR_USERNAME'))
-        parser.set_defaults(os_password=utils.env('HARBOR_PASSWORD'))
-        parser.set_defaults(os_project=utils.env('HARBOR_PROJECT'))
-        parser.set_defaults(os_baseurl=utils.env('HARBOR_URL'))
-
-    def get_base_parser(self, argv):
+    def get_base_parser(self):
         parser = HarborClientArgumentParser(
             prog='harbor',
             description=__doc__.strip(),
@@ -95,87 +80,18 @@ class HarborShell(object):
             action='store_true',
             help="Print debugging output.")
 
-        parser.add_argument(
-            '--timings',
-            default=False,
-            action='store_true',
-            help="Print call timing info.")
-
-
-        parser.add_argument(
-            '--os-username',
-            dest='os_username',
-            metavar='<username>',
-            help='Username')
-
-        parser.add_argument(
-            '--os-password',
-            dest='os_password',
-            metavar='<password>',
-            help="User's password")
-
-        parser.add_argument(
-            '--os-project',
-            dest='os_project',
-            metavar='<project>',
-            help="Project Id")
-
-        parser.add_argument(
-            '--timeout',
-            metavar='<timeout>',
-            help="Set request timeout (in seconds).")
-
-        parser.add_argument(
-            '--os-baseurl',
-            metavar='<baseurl>',
-            help='API base url')
-
-        parser.add_argument(
-            '--insecure',
-            default=False,
-            action='store_true',
-            dest='insecure',
-            help='Explicitly allow client to perform '
-            '"insecure" TLS (https) requests. The '
-            'server\'s certificate will not be verified '
-            'against any certificate authorities. This '
-            'option should be used with caution.')
-
-        parser.add_argument(
-            '--os-cacert',
-            dest='os_cacert',
-            metavar='<ca-certificate>',
-            default=os.environ.get('OS_CACERT'),
-            help='Specify a CA bundle file to use in '
-            'verifying a TLS (https) server certificate. '
-            'Defaults to env[OS_CACERT].')
-
-        parser.add_argument(
-            '--os-api-version',
-            metavar='<api-version>',
-            default=utils.env(
-                'HARBOR_API_VERSION', default=DEFAULT_API_VERSION),
-            help=('Accepts X, X.Y (where X is major and Y is minor part) or '
-                  '"X.latest", defaults to env[HARBOR_API_VERSION].'))
-
-        self._append_global_identity_args(parser, argv)
-
         return parser
 
-    def get_subcommand_parser(self, version, do_help=False, argv=None):
-        parser = self.get_base_parser(argv)
+    def get_subcommand_parser(self):
+        parser = self.get_base_parser()
 
         self.subcommands = {}
         subparsers = parser.add_subparsers(metavar='<subcommand>')
 
-        actions_module = importutils.import_module(
-            "harborclient.v%s.shell" % version.ver_major)
-        actions_module2 = importutils.import_module(
-            "harborclient.v2.%s" % "jobs")
-
-        self._find_actions(subparsers, actions_module, version, do_help)
-        self._find_actions(subparsers, actions_module2, version, do_help)
-        self._find_actions(subparsers, self, version, do_help)
+        for module in __defined_modules__:
+            actions_module = importutils.import_module(module)
+            self._find_actions(subparsers, actions_module)
+        self._find_actions(subparsers, self)
         self._add_bash_completion_subparser(subparsers)
 
         return parser
@@ -188,35 +104,12 @@ class HarborShell(object):
         self.subcommands['bash_completion'] = subparser
         subparser.set_defaults(func=self.do_bash_completion)
 
-    def _find_actions(self, subparsers, actions_module, version, do_help):
-        msg = " (Supported by API versions '%(start)s' - '%(end)s')"
+    def _find_actions(self, subparsers, actions_module):
         for attr in (a for a in dir(actions_module) if a.startswith('do_')):
             # I prefer to be hyphen-separated instead of underscores.
             command = attr[3:].replace('_', '-')
             callback = getattr(actions_module, attr)
             desc = callback.__doc__ or ''
-            if hasattr(callback, "versioned"):
-                additional_msg = ""
-                subs = api_versions.get_substitutions(
-                    utils.get_function_name(callback))
-                if do_help:
-                    additional_msg = msg % {
-                        'start': subs[0].start_version.get_string(),
-                        'end': subs[-1].end_version.get_string()
-                    }
-                subs = [
-                    versioned_method for versioned_method in subs
-                    if version.matches(versioned_method.start_version,
-                                       versioned_method.end_version)
-                ]
-                if subs:
-                    # use the "latest" substitution
-                    callback = subs[-1].func
-                else:
-                    # there is no proper versioned method
-                    continue
-                desc = callback.__doc__ or desc
-                desc += additional_msg
 
             action_help = desc.strip()
             arguments = getattr(callback, 'arguments', [])
@@ -234,26 +127,7 @@ class HarborShell(object):
                 help=argparse.SUPPRESS, )
             self.subcommands[command] = subparser
             for (args, kwargs) in arguments:
-                start_version = kwargs.get("start_version", None)
-                if start_version:
-                    start_version = api_versions.APIVersion(start_version)
-                    end_version = kwargs.get("end_version", None)
-                    if end_version:
-                        end_version = api_versions.APIVersion(end_version)
-                    else:
-                        end_version = api_versions.APIVersion(
-                            "%s.latest" % start_version.ver_major)
-                    if do_help:
-                        kwargs["help"] = kwargs.get("help", "") + (
-                            msg % {
-                                "start": start_version.get_string(),
-                                "end": end_version.get_string()
-                            })
-                    if not version.matches(start_version, end_version):
-                        continue
                 kw = kwargs.copy()
-                kw.pop("start_version", None)
-                kw.pop("end_version", None)
                 subparser.add_argument(*args, **kw)
             subparser.set_defaults(func=callback)
 
@@ -266,25 +140,15 @@ class HarborShell(object):
 
     def main(self, argv):
         # Parse args once to find version and debug settings
-        parser = self.get_base_parser(argv)
+        parser = self.get_base_parser()
         (args, args_list) = parser.parse_known_args(argv)
         self.setup_debugging(args.debug)
         do_help = ('help' in argv) or ('--help' in argv) or (
             '-h' in argv) or not argv
 
         # bash-completion should not require authentication
-        if not args.os_api_version:
-            api_version = api_versions.get_api_version(
-                DEFAULT_MAJOR_OS_COMPUTE_API_VERSION)
-        else:
-            api_version = api_versions.get_api_version(args.os_api_version)
 
-        os_username = args.os_username
-        os_password = args.os_password
-        os_project = args.os_project
-        os_baseurl = args.os_baseurl
-        subcommand_parser = self.get_subcommand_parser(
-            api_version, do_help=do_help, argv=argv)
+        subcommand_parser = self.get_subcommand_parser()
         self.parser = subcommand_parser
 
         if args.help or not argv:
@@ -300,55 +164,9 @@ class HarborShell(object):
         elif args.func == self.do_bash_completion:
             self.do_bash_completion(args)
             return 0
-        insecure = args.insecure
-        cacert = args.os_cacert
-        if not os_baseurl:
-            print(("ERROR (CommandError): You must provide harbor url via "
-                   "either --os-baseurl or env[HARBOR_URL]."))
-            return 1
-        if not os_username:
-            print(("ERROR (CommandError): You must provide username via "
-                   "either --os-username or env[HARBOR_USERNAME]."))
-            return 1
-        if not os_project:
-            print(("ERROR (CommandError): You must provide project via "
-                   "either --os-project or env[HARBOR_PROJECT]."))
-            return 1
-        while not os_password:
-            os_password = getpass.getpass("password: ")
-        self.cs = client.Client(
-            api_version,
-            os_username,
-            os_password,
-            os_project,
-            os_baseurl,
-            timings=args.timings,
-            http_log_debug=args.debug,
-            insecure=insecure,
-            cacert=cacert,
-            timeout=args.timeout)
-        try:
-            self.cs.authenticate()
-        except exc.Unauthorized:
-            raise exc.CommandError("Invalid Harbor credentials.")
-        except exc.AuthorizationFailure as e:
-            raise exc.CommandError("Unable to authorize user '%s': %s"
-                                   % (os_username, e))
-        args.func(self.cs, args)
-        if args.timings:
-            self._dump_timings(self.times + self.cs.get_timings())
 
-    def _dump_timings(self, timings):
-        results = [{
-            "url": url,
-            "seconds": end - start
-        } for url, start, end in timings]
-        total = 0.0
-        for tyme in results:
-            total += tyme['seconds']
-        results.append({"url": "Total", "seconds": total})
-        utils.print_list(results, ["url", "seconds"], align='l')
-        print("Total: %s seconds" % total)
+        args.func(args)
+
 
     def do_bash_completion(self, _args):
         """Print bash completion
@@ -377,7 +195,7 @@ class HarborShell(object):
             if args.command in self.subcommands:
                 self.subcommands[args.command].print_help()
             else:
-                raise exc.CommandError(
+                raise Exception(
                     ("'%s' is not a valid subcommand") % args.command)
         else:
             self.parser.print_help()
@@ -400,13 +218,14 @@ class HarborHelpFormatter(argparse.HelpFormatter):
 
 
 def main():
+
     try:
-        argv = [encodeutils.safe_decode(a) for a in sys.argv[1:]]
+        argv = sys.argv[1:]
         HarborShell().main(argv)
     except KeyboardInterrupt:
         print("... terminating harbor client", file=sys.stderr)
         sys.exit(130)
-    except exc.CommandError as e:
+    except Exception as e:
         print("CommandError: %s" % e)
         sys.exit(127)
 
